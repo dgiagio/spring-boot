@@ -11,6 +11,7 @@ import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.lang.ref.Reference;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.charset.Charset;
@@ -28,6 +29,7 @@ import java.util.zip.ZipEntry;
 import java.util.zip.ZipFile;
 import java.util.zip.ZipOutputStream;
 
+import org.assertj.core.extractor.Extractors;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Assumptions;
 import org.junit.jupiter.api.BeforeEach;
@@ -136,6 +138,23 @@ class ZipContentTests {
 	}
 
 	@Test
+	void getEntryWhenCentralDirectoryHasBeenReclaimedReadsCentralDirectoryAgain() {
+		clearCentralDirectoryReference(this.zipContent);
+		Entry entry = this.zipContent.getEntry("1.dat");
+		assertThat(entry).isNotNull();
+		assertThat(entry.getName()).isEqualTo("1.dat");
+		assertThat(this.zipContent.hasEntry(null, "d/9.dat")).isTrue();
+	}
+
+	@Test
+	void getEntryWhenClosedAndCentralDirectoryHasBeenReclaimedThrowsException() throws IOException {
+		this.zipContent.close();
+		clearCentralDirectoryReference(this.zipContent);
+		assertThatIllegalStateException().isThrownBy(() -> this.zipContent.getEntry("1.dat"))
+			.withMessage("Zip content closed");
+	}
+
+	@Test
 	void getEntryWithPrefixWhenPresentReturnsEntry() {
 		Entry entry = this.zipContent.getEntry("1", ".dat");
 		assertThat(entry).isNotNull();
@@ -205,6 +224,11 @@ class ZipContentTests {
 		try (ZipContent nested = ZipContent.open(this.file.toPath(), "d/")) {
 			assertThat(nested.getKind()).isEqualTo(Kind.NESTED_DIRECTORY);
 		}
+	}
+
+	private void clearCentralDirectoryReference(ZipContent zipContent) {
+		Reference<?> reference = (Reference<?>) Extractors.byName("centralDirectory.data").apply(zipContent);
+		reference.clear();
 	}
 
 	private void assertThatFieldsAreEqual(ZipEntry actual, ZipEntry expected) {

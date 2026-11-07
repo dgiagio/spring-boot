@@ -31,9 +31,9 @@ class NestedJarFileResources implements Runnable {
 
 	private static final int INFLATER_CACHE_LIMIT = 20;
 
-	private ZipContent zipContent;
+	private volatile ZipContent zipContent;
 
-	private ZipContent zipContentForManifest;
+	private volatile ZipContent zipContentForManifest;
 
 	private final Set<InputStream> inputStreams = Collections.newSetFromMap(new WeakHashMap<>());
 

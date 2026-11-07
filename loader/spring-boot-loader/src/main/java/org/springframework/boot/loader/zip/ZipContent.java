@@ -38,6 +38,11 @@ import org.springframework.boot.loader.log.DebugLogger;
  * {@link ZipContent} for a typical Spring Boot application JAR will have somewhere in the
  * region of 10,500 entries which should consume about 122K.
  * <p>
+ * The bytes of the central directory, typically around 110 bytes per entry, are also kept
+ * in memory so that entries can be found without file I/O or locking. They are softly
+ * referenced so that they can be reclaimed under memory pressure, in which case they are
+ * read again when next needed.
+ * <p>
  * {@link ZipContent} results are cached and it is assumed that zip content will not
  * change once loaded. Entries and Strings are not cached and will be recreated on each
  * access which may produce a lot of garbage.
@@ -64,6 +69,8 @@ public final class ZipContent implements Closeable {
 
 	private final long centralDirectoryPos;
 
+	private final CentralDirectory centralDirectory;
+
 	private final long commentPos;
 
 	private final long commentLength;
@@ -82,13 +89,15 @@ public final class ZipContent implements Closeable {
 
 	private SoftReference<Map<Class<?>, Object>> info;
 
-	private ZipContent(Source source, Kind kind, FileDataBlock data, long centralDirectoryPos, long commentPos,
-			long commentLength, int[] lookupIndexes, int[] nameHashLookups, int[] relativeCentralDirectoryOffsetLookups,
-			NameOffsetLookups nameOffsetLookups, boolean hasJarSignatureFile) {
+	private ZipContent(Source source, Kind kind, FileDataBlock data, long centralDirectoryPos,
+			CentralDirectory centralDirectory, long commentPos, long commentLength, int[] lookupIndexes,
+			int[] nameHashLookups, int[] relativeCentralDirectoryOffsetLookups, NameOffsetLookups nameOffsetLookups,
+			boolean hasJarSignatureFile) {
 		this.source = source;
 		this.kind = kind;
 		this.data = data;
 		this.centralDirectoryPos = centralDirectoryPos;
+		this.centralDirectory = centralDirectory;
 		this.commentPos = commentPos;
 		this.commentLength = commentLength;
 		this.lookupIndexes = lookupIndexes;
@@ -200,11 +209,16 @@ public final class ZipContent implements Closeable {
 	public Entry getEntry(CharSequence namePrefix, CharSequence name) {
 		int nameHash = nameHash(namePrefix, name);
 		int lookupIndex = getFirstLookupIndex(nameHash);
+		if (lookupIndex < 0) {
+			return null;
+		}
+		DataBlock centralDirectoryData = getCentralDirectoryData();
 		int size = size();
-		while (lookupIndex >= 0 && lookupIndex < size && this.nameHashLookups[lookupIndex] == nameHash) {
-			long pos = getCentralDirectoryFileHeaderRecordPos(lookupIndex);
-			ZipCentralDirectoryFileHeaderRecord centralRecord = loadZipCentralDirectoryFileHeaderRecord(pos);
-			if (hasName(lookupIndex, centralRecord, pos, namePrefix, name)) {
+		while (lookupIndex < size && this.nameHashLookups[lookupIndex] == nameHash) {
+			long pos = getRelativeCentralDirectoryFileHeaderRecordPos(lookupIndex);
+			ZipCentralDirectoryFileHeaderRecord centralRecord = loadZipCentralDirectoryFileHeaderRecord(
+					centralDirectoryData, pos);
+			if (hasName(centralDirectoryData, lookupIndex, centralRecord, pos, namePrefix, name)) {
 				return new Entry(lookupIndex, centralRecord);
 			}
 			lookupIndex++;
@@ -221,11 +235,16 @@ public final class ZipContent implements Closeable {
 	public boolean hasEntry(CharSequence namePrefix, CharSequence name) {
 		int nameHash = nameHash(namePrefix, name);
 		int lookupIndex = getFirstLookupIndex(nameHash);
+		if (lookupIndex < 0) {
+			return false;
+		}
+		DataBlock centralDirectoryData = getCentralDirectoryData();
 		int size = size();
-		while (lookupIndex >= 0 && lookupIndex < size && this.nameHashLookups[lookupIndex] == nameHash) {
-			long pos = getCentralDirectoryFileHeaderRecordPos(lookupIndex);
-			ZipCentralDirectoryFileHeaderRecord centralRecord = loadZipCentralDirectoryFileHeaderRecord(pos);
-			if (hasName(lookupIndex, centralRecord, pos, namePrefix, name)) {
+		while (lookupIndex < size && this.nameHashLookups[lookupIndex] == nameHash) {
+			long pos = getRelativeCentralDirectoryFileHeaderRecordPos(lookupIndex);
+			ZipCentralDirectoryFileHeaderRecord centralRecord = loadZipCentralDirectoryFileHeaderRecord(
+					centralDirectoryData, pos);
+			if (hasName(centralDirectoryData, lookupIndex, centralRecord, pos, namePrefix, name)) {
 				return true;
 			}
 			lookupIndex++;
@@ -241,14 +260,25 @@ public final class ZipContent implements Closeable {
 	 */
 	public Entry getEntry(int index) {
 		int lookupIndex = ZipContent.this.lookupIndexes[index];
-		long pos = getCentralDirectoryFileHeaderRecordPos(lookupIndex);
-		ZipCentralDirectoryFileHeaderRecord centralRecord = loadZipCentralDirectoryFileHeaderRecord(pos);
+		long pos = getRelativeCentralDirectoryFileHeaderRecordPos(lookupIndex);
+		ZipCentralDirectoryFileHeaderRecord centralRecord = loadZipCentralDirectoryFileHeaderRecord(
+				getCentralDirectoryData(), pos);
 		return new Entry(lookupIndex, centralRecord);
 	}
 
-	private ZipCentralDirectoryFileHeaderRecord loadZipCentralDirectoryFileHeaderRecord(long pos) {
+	private ZipCentralDirectoryFileHeaderRecord loadZipCentralDirectoryFileHeaderRecord(DataBlock centralDirectoryData,
+			long pos) {
 		try {
-			return ZipCentralDirectoryFileHeaderRecord.load(this.data, pos);
+			return ZipCentralDirectoryFileHeaderRecord.load(centralDirectoryData, pos);
+		}
+		catch (IOException ex) {
+			throw new UncheckedIOException(ex);
+		}
+	}
+
+	private DataBlock getCentralDirectoryData() {
+		try {
+			return this.centralDirectory.getData();
 		}
 		catch (IOException ex) {
 			if (ex instanceof ClosedChannelException) {
@@ -277,24 +307,28 @@ public final class ZipContent implements Closeable {
 	}
 
 	private long getCentralDirectoryFileHeaderRecordPos(int lookupIndex) {
-		return this.centralDirectoryPos + this.relativeCentralDirectoryOffsetLookups[lookupIndex];
+		return this.centralDirectoryPos + getRelativeCentralDirectoryFileHeaderRecordPos(lookupIndex);
 	}
 
-	private boolean hasName(int lookupIndex, ZipCentralDirectoryFileHeaderRecord centralRecord, long pos,
-			CharSequence namePrefix, CharSequence name) {
+	private long getRelativeCentralDirectoryFileHeaderRecordPos(int lookupIndex) {
+		return this.relativeCentralDirectoryOffsetLookups[lookupIndex];
+	}
+
+	private boolean hasName(DataBlock centralDirectoryData, int lookupIndex,
+			ZipCentralDirectoryFileHeaderRecord centralRecord, long pos, CharSequence namePrefix, CharSequence name) {
 		int offset = this.nameOffsetLookups.get(lookupIndex);
 		pos += ZipCentralDirectoryFileHeaderRecord.FILE_NAME_OFFSET + offset;
 		int len = centralRecord.fileNameLength() - offset;
 		ByteBuffer buffer = ByteBuffer.allocate(ZipString.BUFFER_SIZE);
 		if (namePrefix != null) {
-			int startsWithNamePrefix = ZipString.startsWith(buffer, this.data, pos, len, namePrefix);
+			int startsWithNamePrefix = ZipString.startsWith(buffer, centralDirectoryData, pos, len, namePrefix);
 			if (startsWithNamePrefix == -1) {
 				return false;
 			}
 			pos += startsWithNamePrefix;
 			len -= startsWithNamePrefix;
 		}
-		return ZipString.matches(buffer, this.data, pos, len, name, true);
+		return ZipString.matches(buffer, centralDirectoryData, pos, len, name, true);
 	}
 
 	/**
@@ -443,6 +477,10 @@ public final class ZipContent implements Closeable {
 
 		private final long centralDirectoryPos;
 
+		private final CentralDirectory centralDirectory;
+
+		private final DataBlock centralDirectoryData;
+
 		private final int[] index;
 
 		private int[] nameHashLookups;
@@ -453,10 +491,13 @@ public final class ZipContent implements Closeable {
 
 		private int cursor;
 
-		private Loader(Source source, Entry directoryEntry, FileDataBlock data, long centralDirectoryPos, int maxSize) {
+		private Loader(Source source, Entry directoryEntry, FileDataBlock data, long centralDirectoryPos,
+				CentralDirectory centralDirectory, DataBlock centralDirectoryData, int maxSize) {
 			this.source = source;
 			this.data = data;
 			this.centralDirectoryPos = centralDirectoryPos;
+			this.centralDirectory = centralDirectory;
+			this.centralDirectoryData = centralDirectoryData;
 			this.index = new int[maxSize];
 			this.nameHashLookups = new int[maxSize];
 			this.relativeCentralDirectoryOffsetLookups = new int[maxSize];
@@ -468,11 +509,11 @@ public final class ZipContent implements Closeable {
 		private void add(ZipCentralDirectoryFileHeaderRecord centralRecord, long pos, boolean enableNameOffset)
 				throws IOException {
 			int nameOffset = this.nameOffsetLookups.enable(this.cursor, enableNameOffset);
-			int hash = ZipString.hash(this.buffer, this.data,
+			int hash = ZipString.hash(this.buffer, this.centralDirectoryData,
 					pos + ZipCentralDirectoryFileHeaderRecord.FILE_NAME_OFFSET + nameOffset,
 					centralRecord.fileNameLength() - nameOffset, true);
 			this.nameHashLookups[this.cursor] = hash;
-			this.relativeCentralDirectoryOffsetLookups[this.cursor] = (int) ((pos - this.centralDirectoryPos));
+			this.relativeCentralDirectoryOffsetLookups[this.cursor] = (int) pos;
 			this.index[this.cursor] = this.cursor;
 			this.cursor++;
 		}
@@ -489,9 +530,9 @@ public final class ZipContent implements Closeable {
 			for (int i = 0; i < size; i++) {
 				lookupIndexes[this.index[i]] = i;
 			}
-			return new ZipContent(this.source, kind, this.data, this.centralDirectoryPos, commentPos, commentLength,
-					lookupIndexes, this.nameHashLookups, this.relativeCentralDirectoryOffsetLookups,
-					this.nameOffsetLookups, hasJarSignatureFile);
+			return new ZipContent(this.source, kind, this.data, this.centralDirectoryPos, this.centralDirectory,
+					commentPos, commentLength, lookupIndexes, this.nameHashLookups,
+					this.relativeCentralDirectoryOffsetLookups, this.nameOffsetLookups, hasJarSignatureFile);
 		}
 
 		private void sort(int left, int right) {
@@ -593,12 +634,22 @@ public final class ZipContent implements Closeable {
 			if (numberOfEntries > Integer.MAX_VALUE) {
 				throw new IllegalStateException("Too many zip entries in " + source);
 			}
-			Loader loader = new Loader(source, null, data, centralDirectoryPos, (int) numberOfEntries);
+			// Also covers any zip64 end records that precede the eocd
+			long centralDirectorySize = Math.max(eocdPos - centralDirectoryPos, 0);
+			if (centralDirectorySize > Integer.MAX_VALUE) {
+				throw new IllegalStateException("Central directory too large in " + source);
+			}
+			CentralDirectory centralDirectory = new CentralDirectory(data, centralDirectoryPos,
+					(int) centralDirectorySize);
+			DataBlock centralDirectoryData = centralDirectory.getData();
+			Loader loader = new Loader(source, null, data, centralDirectoryPos, centralDirectory, centralDirectoryData,
+					(int) numberOfEntries);
 			SignatureFiles signatureFiles = new SignatureFiles();
-			long pos = centralDirectoryPos;
+			long pos = 0;
 			for (int i = 0; i < numberOfEntries; i++) {
-				ZipCentralDirectoryFileHeaderRecord centralRecord = ZipCentralDirectoryFileHeaderRecord.load(data, pos);
-				signatureFiles.detect(centralRecord, data, pos, loader.buffer);
+				ZipCentralDirectoryFileHeaderRecord centralRecord = ZipCentralDirectoryFileHeaderRecord
+					.load(centralDirectoryData, pos);
+				signatureFiles.detect(centralRecord, centralDirectoryData, pos, loader.buffer);
 				loader.add(centralRecord, pos, false);
 				pos += centralRecord.size();
 			}
@@ -649,16 +700,19 @@ public final class ZipContent implements Closeable {
 			String directoryName = directoryEntry.getName();
 			zip.data.open();
 			try {
-				Loader loader = new Loader(source, directoryEntry, zip.data, zip.centralDirectoryPos, zip.size());
+				DataBlock centralDirectoryData = zip.centralDirectory.getData();
+				Loader loader = new Loader(source, directoryEntry, zip.data, zip.centralDirectoryPos,
+						zip.centralDirectory, centralDirectoryData, zip.size());
 				for (int cursor = 0; cursor < zip.size(); cursor++) {
 					int index = zip.lookupIndexes[cursor];
 					if (index != directoryEntry.getLookupIndex()) {
-						long pos = zip.getCentralDirectoryFileHeaderRecordPos(index);
+						long pos = zip.getRelativeCentralDirectoryFileHeaderRecordPos(index);
 						ZipCentralDirectoryFileHeaderRecord centralRecord = ZipCentralDirectoryFileHeaderRecord
-							.load(zip.data, pos);
+							.load(centralDirectoryData, pos);
 						long namePos = pos + ZipCentralDirectoryFileHeaderRecord.FILE_NAME_OFFSET;
 						short nameLen = centralRecord.fileNameLength();
-						if (ZipString.startsWith(loader.buffer, zip.data, namePos, nameLen, directoryName) != -1) {
+						if (ZipString.startsWith(loader.buffer, centralDirectoryData, namePos, nameLen,
+								directoryName) != -1) {
 							loader.add(centralRecord, pos, true);
 						}
 					}
@@ -669,6 +723,47 @@ public final class ZipContent implements Closeable {
 				zip.data.close();
 				throw ex;
 			}
+		}
+
+	}
+
+	/**
+	 * In-memory copy of the bytes of a central directory, softly referenced and read
+	 * again from the zip data if they have been reclaimed.
+	 */
+	private static final class CentralDirectory {
+
+		private final FileDataBlock zipData;
+
+		private final long pos;
+
+		private final int size;
+
+		private volatile SoftReference<DataBlock> data;
+
+		CentralDirectory(FileDataBlock zipData, long pos, int size) {
+			this.zipData = zipData;
+			this.pos = pos;
+			this.size = size;
+		}
+
+		DataBlock getData() throws IOException {
+			DataBlock data = (this.data != null) ? this.data.get() : null;
+			return (data != null) ? data : load();
+		}
+
+		private synchronized DataBlock load() throws IOException {
+			DataBlock data = (this.data != null) ? this.data.get() : null;
+			if (data == null) {
+				debug.log("Loading central directory from position %s with size %s", this.pos, this.size);
+				ByteBuffer buffer = ByteBuffer.allocate(this.size);
+				if (this.size > 0) {
+					this.zipData.readFully(buffer, this.pos);
+				}
+				data = new ByteArrayDataBlock(buffer.array());
+				this.data = new SoftReference<>(data);
+			}
+			return data;
 		}
 
 	}
@@ -692,7 +787,7 @@ public final class ZipContent implements Closeable {
 			this.buffer = ByteBuffer.allocate(4);
 		}
 
-		void detect(ZipCentralDirectoryFileHeaderRecord centralRecord, FileDataBlock data, long pos,
+		void detect(ZipCentralDirectoryFileHeaderRecord centralRecord, DataBlock data, long pos,
 				ByteBuffer loadedBuffer) throws IOException {
 			if (!this.detected) {
 				long filenamePos = pos + ZipCentralDirectoryFileHeaderRecord.FILE_NAME_OFFSET;
@@ -773,10 +868,10 @@ public final class ZipContent implements Closeable {
 				return name.startsWith(prefix.toString());
 			}
 			int offset = ZipContent.this.nameOffsetLookups.get(this.lookupIndex);
-			long pos = getCentralDirectoryFileHeaderRecordPos(this.lookupIndex)
+			long pos = getRelativeCentralDirectoryFileHeaderRecordPos(this.lookupIndex)
 					+ ZipCentralDirectoryFileHeaderRecord.FILE_NAME_OFFSET + offset;
-			return ZipString.startsWith(null, ZipContent.this.data, pos, this.centralRecord.fileNameLength() - offset,
-					prefix) != -1;
+			return ZipString.startsWith(null, getCentralDirectoryData(), pos,
+					this.centralRecord.fileNameLength() - offset, prefix) != -1;
 		}
 
 		/**
@@ -787,9 +882,10 @@ public final class ZipContent implements Closeable {
 			String name = this.name;
 			if (name == null) {
 				int offset = ZipContent.this.nameOffsetLookups.get(this.lookupIndex);
-				long pos = getCentralDirectoryFileHeaderRecordPos(this.lookupIndex)
+				long pos = getRelativeCentralDirectoryFileHeaderRecordPos(this.lookupIndex)
 						+ ZipCentralDirectoryFileHeaderRecord.FILE_NAME_OFFSET + offset;
-				name = ZipString.readString(ZipContent.this.data, pos, this.centralRecord.fileNameLength() - offset);
+				name = ZipString.readString(getCentralDirectoryData(), pos,
+						this.centralRecord.fileNameLength() - offset);
 				this.name = name;
 			}
 			return name;
@@ -867,8 +963,8 @@ public final class ZipContent implements Closeable {
 		public <E extends ZipEntry> E as(BiFunction<Entry, String, E> factory) {
 			try {
 				E result = factory.apply(this, getName());
-				long pos = getCentralDirectoryFileHeaderRecordPos(this.lookupIndex);
-				this.centralRecord.copyTo(ZipContent.this.data, pos, result);
+				long pos = getRelativeCentralDirectoryFileHeaderRecordPos(this.lookupIndex);
+				this.centralRecord.copyTo(getCentralDirectoryData(), pos, result);
 				return result;
 			}
 			catch (IOException ex) {

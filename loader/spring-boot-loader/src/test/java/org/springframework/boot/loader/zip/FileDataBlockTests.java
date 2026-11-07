@@ -7,18 +7,34 @@ package org.springframework.boot.loader.zip;
 import java.io.File;
 import java.io.IOException;
 import java.nio.ByteBuffer;
+import java.nio.channels.FileChannel;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.time.Duration;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.List;
+import java.util.Queue;
+import java.util.Random;
+import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.locks.ReentrantLock;
 
+import org.assertj.core.extractor.Extractors;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
+import org.springframework.boot.loader.zip.FileDataBlock.FileAccess;
 import org.springframework.boot.loader.zip.FileDataBlock.Tracker;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatIllegalArgumentException;
+import static org.awaitility.Awaitility.await;
 
 /**
  * Tests for {@link FileDataBlock}.
@@ -201,6 +217,166 @@ class FileDataBlockTests {
 		slice.close();
 		assertThat(slice).extracting("fileAccess.referenceCount").isEqualTo(0);
 		tracker.assertOpenCloseCounts(2, 2);
+	}
+
+	@Test
+	void readWhenChannelHasBeenClosedByInterruptOfAnotherThreadReopensChannel() throws IOException {
+		byte[] content = createContent(FileAccess.BUFFER_SIZE * 3);
+		Files.write(this.tempFile.toPath(), content);
+		TestTracker tracker = new TestTracker();
+		FileDataBlock.tracker = tracker;
+		try (FileDataBlock block = createAndOpenBlock()) {
+			ByteBuffer buffer = ByteBuffer.allocate(16);
+			block.readFully(buffer, 0);
+			getFileChannel(block).close();
+			buffer.clear();
+			int pos = FileAccess.BUFFER_SIZE * 2;
+			block.readFully(buffer, pos);
+			assertThat(buffer.array()).containsExactly(Arrays.copyOfRange(content, pos, pos + 16));
+			assertThat(getFileChannel(block).isOpen()).isTrue();
+			tracker.assertOpenCloseCounts(2, 1);
+		}
+		tracker.assertOpenCloseCounts(2, 2);
+	}
+
+	@Test
+	void readWhenLockIsHeldByAnotherThreadReadsFromChannel() throws Exception {
+		ExecutorService lockExecutor = Executors.newSingleThreadExecutor();
+		ExecutorService readExecutor = Executors.newSingleThreadExecutor();
+		try (FileDataBlock block = createAndOpenBlock()) {
+			ReentrantLock lock = getLock(block);
+			lockExecutor.submit(lock::lock).get();
+			try {
+				ByteBuffer buffer = ByteBuffer.allocate(CONTENT.length);
+				Future<Integer> read = readExecutor.submit(() -> block.read(buffer, 1));
+				assertThat(read.get(30, TimeUnit.SECONDS)).isEqualTo(5);
+				assertThat(buffer.array()).containsExactly(0x01, 0x02, 0x03, 0x04, 0x05, 0x00);
+			}
+			finally {
+				lockExecutor.submit(lock::unlock).get();
+			}
+		}
+		finally {
+			lockExecutor.shutdown();
+			readExecutor.shutdown();
+		}
+	}
+
+	@Test
+	void readWhenLockIsHeldByAnotherThreadAndChannelHasBeenClosedWaitsForLock() throws Exception {
+		ExecutorService lockExecutor = Executors.newSingleThreadExecutor();
+		ExecutorService readExecutor = Executors.newSingleThreadExecutor();
+		try (FileDataBlock block = createAndOpenBlock()) {
+			ReentrantLock lock = getLock(block);
+			lockExecutor.submit(lock::lock).get();
+			Future<Integer> read;
+			try {
+				getFileChannel(block).close();
+				read = readExecutor.submit(() -> block.read(ByteBuffer.allocate(CONTENT.length), 0));
+				await().atMost(Duration.ofSeconds(30)).until(lock::hasQueuedThreads);
+				assertThat(read).isNotDone();
+			}
+			finally {
+				lockExecutor.submit(lock::unlock).get();
+			}
+			assertThat(read.get(30, TimeUnit.SECONDS)).isEqualTo(6);
+			assertThat(getFileChannel(block).isOpen()).isTrue();
+		}
+		finally {
+			lockExecutor.shutdown();
+			readExecutor.shutdown();
+		}
+	}
+
+	@Test
+	void readWhenReadingThreadsAreInterruptedReturnsContent() throws Exception {
+		byte[] content = createContent(FileAccess.BUFFER_SIZE * 20);
+		Files.write(this.tempFile.toPath(), content);
+		TestTracker tracker = new TestTracker();
+		FileDataBlock.tracker = tracker;
+		FileDataBlock block = createAndOpenBlock();
+		Queue<Throwable> failures = new ConcurrentLinkedQueue<>();
+		List<Thread> threads = new ArrayList<>();
+		for (int i = 0; i < 8; i++) {
+			Random random = new Random(i);
+			threads.add(new Thread(() -> {
+				try {
+					ByteBuffer buffer = ByteBuffer.allocate(512);
+					for (int j = 0; j < 2000; j++) {
+						int pos = random.nextInt(content.length - buffer.capacity());
+						buffer.clear();
+						block.readFully(buffer, pos);
+						Thread.interrupted();
+						assertThat(buffer.array()).isEqualTo(Arrays.copyOfRange(content, pos, pos + buffer.capacity()));
+					}
+				}
+				catch (Throwable ex) {
+					failures.add(ex);
+				}
+			}));
+		}
+		threads.forEach(Thread::start);
+		Random random = new Random();
+		while (threads.stream().anyMatch(Thread::isAlive)) {
+			threads.get(random.nextInt(threads.size())).interrupt();
+			Thread.onSpinWait();
+		}
+		for (Thread thread : threads) {
+			thread.join();
+		}
+		block.close();
+		assertThat(failures).isEmpty();
+		assertThat(tracker.openCount).isEqualTo(tracker.closeCount);
+	}
+
+	@Test
+	void openAndCloseFromMultipleThreadsHandleReferenceCounting() throws Exception {
+		TestTracker tracker = new TestTracker();
+		FileDataBlock.tracker = tracker;
+		FileDataBlock block = createBlock();
+		Queue<Throwable> failures = new ConcurrentLinkedQueue<>();
+		List<Thread> threads = new ArrayList<>();
+		for (int i = 0; i < 8; i++) {
+			threads.add(new Thread(() -> {
+				try {
+					for (int j = 0; j < 5000; j++) {
+						block.open();
+						try {
+							ByteBuffer buffer = ByteBuffer.allocate(CONTENT.length);
+							assertThat(block.read(buffer, 0)).isEqualTo(CONTENT.length);
+						}
+						finally {
+							block.close();
+						}
+					}
+				}
+				catch (Throwable ex) {
+					failures.add(ex);
+				}
+			}));
+		}
+		threads.forEach(Thread::start);
+		for (Thread thread : threads) {
+			thread.join();
+		}
+		assertThat(failures).isEmpty();
+		assertThat(block).extracting("fileAccess.referenceCount").isEqualTo(0);
+		assertThat(getFileChannel(block)).isNull();
+		assertThat(tracker.openCount).isEqualTo(tracker.closeCount);
+	}
+
+	private FileChannel getFileChannel(FileDataBlock block) {
+		return (FileChannel) Extractors.byName("fileAccess.fileChannel").apply(block);
+	}
+
+	private ReentrantLock getLock(FileDataBlock block) {
+		return (ReentrantLock) Extractors.byName("fileAccess.lock").apply(block);
+	}
+
+	private byte[] createContent(int size) {
+		byte[] content = new byte[size];
+		new Random(0).nextBytes(content);
+		return content;
 	}
 
 	private FileDataBlock createAndOpenBlock() throws IOException {

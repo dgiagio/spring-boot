@@ -11,11 +11,14 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.lang.ref.Cleaner.Cleanable;
 import java.nio.charset.Charset;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Enumeration;
 import java.util.List;
+import java.util.Queue;
 import java.util.UUID;
+import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.jar.JarEntry;
 import java.util.jar.JarFile;
 import java.util.jar.JarOutputStream;
@@ -297,6 +300,55 @@ class NestedJarFileTests {
 			action.getValue().run();
 			assertThat(channel).extracting("referenceCount").isEqualTo(0);
 		}
+	}
+
+	@Test
+	void concurrentAccessReturnsEntriesAndContent() throws Exception {
+		File file = new File(this.tempDir, "concurrent.jar");
+		int entryCount = 500;
+		try (JarOutputStream jarOutputStream = new JarOutputStream(new FileOutputStream(file))) {
+			for (int i = 0; i < entryCount; i++) {
+				jarOutputStream.putNextEntry(new JarEntry("entries/" + i + ".txt"));
+				jarOutputStream.write(concurrentEntryContent(i).getBytes(StandardCharsets.UTF_8));
+				jarOutputStream.closeEntry();
+			}
+		}
+		try (NestedJarFile jar = new NestedJarFile(file)) {
+			Queue<Throwable> failures = new ConcurrentLinkedQueue<>();
+			List<Thread> threads = new ArrayList<>();
+			for (int i = 0; i < 8; i++) {
+				int offset = i * 61;
+				threads.add(new Thread(() -> {
+					try {
+						for (int j = 0; j < 1000; j++) {
+							int index = (offset + j) % entryCount;
+							String name = "entries/" + index + ".txt";
+							assertThat(jar.hasEntry(name)).isTrue();
+							try (InputStream inputStream = jar.getInputStream(jar.getJarEntry(name))) {
+								assertThat(new String(inputStream.readAllBytes(), StandardCharsets.UTF_8))
+									.isEqualTo(concurrentEntryContent(index));
+							}
+							if (j % 250 == 0) {
+								assertThat(jar.stream().count()).isEqualTo(entryCount);
+								jar.clearCache();
+							}
+						}
+					}
+					catch (Throwable ex) {
+						failures.add(ex);
+					}
+				}));
+			}
+			threads.forEach(Thread::start);
+			for (Thread thread : threads) {
+				thread.join();
+			}
+			assertThat(failures).isEmpty();
+		}
+	}
+
+	private String concurrentEntryContent(int index) {
+		return ("entry " + index + " ").repeat(index % 50 + 1);
 	}
 
 	@Test

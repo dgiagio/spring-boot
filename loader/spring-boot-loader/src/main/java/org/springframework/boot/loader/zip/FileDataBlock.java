@@ -8,12 +8,13 @@ import java.io.File;
 import java.io.IOException;
 import java.io.RandomAccessFile;
 import java.nio.ByteBuffer;
-import java.nio.channels.ClosedByInterruptException;
 import java.nio.channels.ClosedChannelException;
 import java.nio.channels.FileChannel;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
+import java.util.concurrent.atomic.AtomicIntegerFieldUpdater;
+import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.Supplier;
 
 import org.springframework.boot.loader.log.DebugLogger;
@@ -141,18 +142,26 @@ class FileDataBlock implements CloseableDataBlock {
 
 	/**
 	 * Manages access to underlying {@link FileChannel}.
+	 * <p>
+	 * Reads are served from a read-ahead buffer that is guarded by a lock. A thread that
+	 * finds the lock held reads directly from the channel instead of waiting for it. An
+	 * interrupt during a channel read closes the channel for every thread, so a direct
+	 * read that finds the channel closed falls back to a read under the lock. That read
+	 * reopens the channel, or fails if the last reference has been closed. The reference
+	 * count is only updated under the lock when the channel needs to be opened or closed.
 	 */
 	static class FileAccess {
 
 		static final int BUFFER_SIZE = 1024 * 10;
 
+		private static final AtomicIntegerFieldUpdater<FileAccess> referenceCountUpdater = AtomicIntegerFieldUpdater
+			.newUpdater(FileAccess.class, "referenceCount");
+
 		private final Path path;
 
-		private int referenceCount;
+		private volatile int referenceCount;
 
-		private FileChannel fileChannel;
-
-		private boolean fileChannelInterrupted;
+		private volatile FileChannel fileChannel;
 
 		private RandomAccessFile randomAccessFile;
 
@@ -162,7 +171,7 @@ class FileDataBlock implements CloseableDataBlock {
 
 		private int bufferSize;
 
-		private final Object lock = new Object();
+		private final ReentrantLock lock = new ReentrantLock();
 
 		FileAccess(Path path) {
 			if (!Files.isRegularFile(path)) {
@@ -172,37 +181,73 @@ class FileDataBlock implements CloseableDataBlock {
 		}
 
 		int read(ByteBuffer dst, long position) throws IOException {
-			synchronized (this.lock) {
-				if (position < this.bufferPosition || position >= this.bufferPosition + this.bufferSize) {
-					fillBuffer(position);
+			if (!this.lock.tryLock()) {
+				FileChannel fileChannel = this.fileChannel;
+				if (fileChannel != null && !Thread.currentThread().isInterrupted()) {
+					int dstPosition = dst.position();
+					try {
+						return readDirectly(fileChannel, dst, position);
+					}
+					catch (ClosedChannelException ex) {
+						dst.position(dstPosition);
+					}
 				}
-				if (this.bufferSize <= 0) {
-					return this.bufferSize;
-				}
-				int offset = (int) (position - this.bufferPosition);
-				int length = Math.min(this.bufferSize - offset, dst.remaining());
-				dst.put(dst.position(), this.buffer, offset, length);
-				dst.position(dst.position() + length);
-				return length;
+				this.lock.lock();
+			}
+			try {
+				return readUsingBuffer(dst, position);
+			}
+			finally {
+				this.lock.unlock();
 			}
 		}
 
+		private int readDirectly(FileChannel fileChannel, ByteBuffer dst, long position) throws IOException {
+			int limit = dst.limit();
+			dst.limit(dst.position() + Math.min(dst.remaining(), BUFFER_SIZE));
+			try {
+				return fileChannel.read(dst, position);
+			}
+			finally {
+				dst.limit(limit);
+			}
+		}
+
+		private int readUsingBuffer(ByteBuffer dst, long position) throws IOException {
+			if (this.fileChannel == null) {
+				throw new ClosedChannelException();
+			}
+			if (position < this.bufferPosition || position >= this.bufferPosition + this.bufferSize) {
+				fillBuffer(position);
+			}
+			if (this.bufferSize <= 0) {
+				return this.bufferSize;
+			}
+			int offset = (int) (position - this.bufferPosition);
+			int length = Math.min(this.bufferSize - offset, dst.remaining());
+			dst.put(dst.position(), this.buffer, offset, length);
+			dst.position(dst.position() + length);
+			return length;
+		}
+
 		private void fillBuffer(long position) throws IOException {
+			this.bufferPosition = -1;
+			this.bufferSize = 0;
 			if (Thread.currentThread().isInterrupted()) {
 				fillBufferUsingRandomAccessFile(position);
 				return;
 			}
 			try {
-				if (this.fileChannelInterrupted) {
-					repairFileChannel();
-					this.fileChannelInterrupted = false;
+				FileChannel fileChannel = this.fileChannel;
+				if (!fileChannel.isOpen()) {
+					fileChannel = repairFileChannel();
 				}
 				this.buffer.clear();
-				this.bufferSize = this.fileChannel.read(this.buffer, position);
+				this.bufferSize = fileChannel.read(this.buffer, position);
 				this.bufferPosition = position;
 			}
-			catch (ClosedByInterruptException ex) {
-				this.fileChannelInterrupted = true;
+			catch (ClosedChannelException ex) {
+				// This thread or a thread reading directly was interrupted
 				fillBufferUsingRandomAccessFile(position);
 			}
 		}
@@ -223,54 +268,85 @@ class FileDataBlock implements CloseableDataBlock {
 			this.bufferPosition = position;
 		}
 
-		private void repairFileChannel() throws IOException {
+		private FileChannel repairFileChannel() throws IOException {
 			tracker.closedFileChannel(this.path);
-			this.fileChannel = FileChannel.open(this.path, StandardOpenOption.READ);
+			FileChannel fileChannel = FileChannel.open(this.path, StandardOpenOption.READ);
+			this.fileChannel = fileChannel;
 			tracker.openedFileChannel(this.path);
+			return fileChannel;
 		}
 
 		void open() throws IOException {
-			synchronized (this.lock) {
-				if (this.referenceCount == 0) {
-					debug.log("Opening '%s'", this.path);
-					this.fileChannel = FileChannel.open(this.path, StandardOpenOption.READ);
-					this.buffer = ByteBuffer.allocateDirect(BUFFER_SIZE);
-					tracker.openedFileChannel(this.path);
+			int referenceCount = updateReferenceCountWithoutLock(1);
+			if (referenceCount == 0) {
+				this.lock.lock();
+				try {
+					if (this.referenceCount == 0) {
+						debug.log("Opening '%s'", this.path);
+						this.fileChannel = FileChannel.open(this.path, StandardOpenOption.READ);
+						this.buffer = ByteBuffer.allocateDirect(BUFFER_SIZE);
+						tracker.openedFileChannel(this.path);
+					}
+					referenceCount = referenceCountUpdater.incrementAndGet(this);
 				}
-				this.referenceCount++;
-				debug.log("Reference count for '%s' incremented to %s", this.path, this.referenceCount);
+				finally {
+					this.lock.unlock();
+				}
 			}
+			debug.log("Reference count for '%s' incremented to %s", this.path, referenceCount);
 		}
 
 		void close() throws IOException {
-			synchronized (this.lock) {
-				if (this.referenceCount == 0) {
-					return;
-				}
-				this.referenceCount--;
-				if (this.referenceCount == 0) {
-					debug.log("Closing '%s'", this.path);
-					this.buffer = null;
-					this.bufferPosition = -1;
-					this.bufferSize = 0;
-					this.fileChannel.close();
-					tracker.closedFileChannel(this.path);
-					this.fileChannel = null;
-					if (this.randomAccessFile != null) {
-						this.randomAccessFile.close();
+			int referenceCount = updateReferenceCountWithoutLock(-1);
+			if (referenceCount == 0) {
+				this.lock.lock();
+				try {
+					if (this.referenceCount == 0) {
+						return;
+					}
+					referenceCount = referenceCountUpdater.decrementAndGet(this);
+					if (referenceCount == 0) {
+						debug.log("Closing '%s'", this.path);
+						this.buffer = null;
+						this.bufferPosition = -1;
+						this.bufferSize = 0;
+						this.fileChannel.close();
 						tracker.closedFileChannel(this.path);
-						this.randomAccessFile = null;
+						this.fileChannel = null;
+						if (this.randomAccessFile != null) {
+							this.randomAccessFile.close();
+							tracker.closedFileChannel(this.path);
+							this.randomAccessFile = null;
+						}
 					}
 				}
-				debug.log("Reference count for '%s' decremented to %s", this.path, this.referenceCount);
+				finally {
+					this.lock.unlock();
+				}
 			}
+			debug.log("Reference count for '%s' decremented to %s", this.path, referenceCount);
+		}
+
+		/**
+		 * Update the reference count without taking the lock, unless the update would
+		 * need to open or close the channel.
+		 * @param delta the amount to add
+		 * @return the updated reference count or {@code 0} if the lock is needed
+		 */
+		private int updateReferenceCountWithoutLock(int delta) {
+			int referenceCount = this.referenceCount;
+			while (referenceCount > 0 && referenceCount + delta > 0) {
+				if (referenceCountUpdater.compareAndSet(this, referenceCount, referenceCount + delta)) {
+					return referenceCount + delta;
+				}
+				referenceCount = this.referenceCount;
+			}
+			return 0;
 		}
 
 		<E extends Exception> void ensureOpen(Supplier<E> exceptionSupplier) throws E {
-			synchronized (this.lock) {
-				if (this.referenceCount == 0) {
-					throw exceptionSupplier.get();
-				}
+			if (this.referenceCount == 0) {
+				throw exceptionSupplier.get();
 			}
 		}
 
