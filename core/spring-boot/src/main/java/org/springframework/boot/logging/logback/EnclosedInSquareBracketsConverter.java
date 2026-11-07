@@ -22,7 +22,7 @@ public class EnclosedInSquareBracketsConverter extends CompositeConverter<ILoggi
 	@Override
 	protected String transform(ILoggingEvent event, @Nullable String in) {
 		in = (!StringUtils.hasLength(in)) ? resolveFromFirstOption(event) : in;
-		return (!StringUtils.hasLength(in)) ? "" : "[%s] ".formatted(in);
+		return (!StringUtils.hasLength(in)) ? "" : "[" + in + "] ";
 	}
 
 	private @Nullable String resolveFromFirstOption(ILoggingEvent event) {
